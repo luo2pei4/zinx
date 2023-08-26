@@ -1,7 +1,9 @@
 package znet
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"luopei/zinx/ziface"
 	"net"
 	"time"
@@ -14,6 +16,14 @@ type Server struct {
 	Port  int
 }
 
+type Connection struct {
+	Conn        *net.TCPConn    // 当前连接的socket tcp套接字
+	ConnID      uint32          // 当前连接的ID
+	isClosed    bool            // 当前连接关闭状态
+	handleAPI   ziface.HandFunc // 该连接的处理方法API
+	ExitBufChan chan bool       // 通知连接推出的chan
+}
+
 func NewServer(name string) ziface.IServer {
 	return &Server{
 		Name:  name,
@@ -21,6 +31,25 @@ func NewServer(name string) ziface.IServer {
 		IP:    "0.0.0.0",
 		Port:  6666,
 	}
+}
+
+func NewConnection(conn *net.TCPConn, connID uint32, callback_api ziface.HandFunc) *Connection {
+	return &Connection{
+		Conn:        conn,
+		ConnID:      connID,
+		isClosed:    false,
+		handleAPI:   callback_api,
+		ExitBufChan: make(chan bool, 1),
+	}
+}
+
+func CallBackToClient(conn *net.TCPConn, data []byte, cnt int) error {
+	fmt.Println("[Conn Handle] CallBackToClient...")
+	if _, err := conn.Write(data[:cnt]); err != nil {
+		fmt.Println("write back buf error,", err.Error())
+		return errors.New("CallBackToClient error")
+	}
+	return nil
 }
 
 func (s *Server) Start() {
@@ -41,6 +70,8 @@ func (s *Server) Start() {
 
 		fmt.Printf("start zinx server %s successed, now listenning...", s.Name)
 
+		cID := uint32(0)
+
 		// 接收tcp数据
 		for {
 			conn, err := listenner.AcceptTCP()
@@ -48,20 +79,12 @@ func (s *Server) Start() {
 				fmt.Printf("listen tcp failed, %s\n", err.Error())
 				continue
 			}
-			go func() {
-				for {
-					buf := make([]byte, 512)
-					n, err := conn.Read(buf)
-					if err != nil {
-						fmt.Printf("read from conn failed, %s\n", err.Error())
-						continue
-					}
-					if _, err := conn.Write(buf[:n]); err != nil {
-						fmt.Printf("write back to conn failed, %s\n", err.Error())
-						continue
-					}
-				}
-			}()
+
+			// 用获取的连接新建一个用来处理链接数据的实例
+			dealConn := NewConnection(conn, cID, CallBackToClient)
+			cID++
+
+			go dealConn.Start()
 		}
 	}()
 }
@@ -76,4 +99,43 @@ func (s *Server) Serve() {
 	for {
 		time.Sleep(10 * time.Second)
 	}
+}
+
+// 读取请求数据的方法，以goroutine形式运行
+func (c *Connection) StartReader() {
+	fmt.Println("Reader goroutine is running")
+	defer fmt.Println(c.Conn.RemoteAddr().String(), "conn reader exit.")
+	defer c.Stop()
+
+	for {
+		buf := make([]byte, 512)
+		n, err := c.Conn.Read(buf)
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				fmt.Println("receive buf failed,", err.Error())
+			}
+			c.ExitBufChan <- true
+			return
+		}
+		if err := c.handleAPI(c.Conn, buf, n); err != nil {
+			fmt.Println("connID", c.ConnID, "handle is error.", err.Error())
+			c.ExitBufChan <- true
+			return
+		}
+	}
+}
+
+func (c *Connection) Start() {
+	go c.StartReader()
+	<-c.ExitBufChan
+}
+
+func (c *Connection) Stop() {
+	if c.isClosed {
+		return
+	}
+	c.isClosed = true
+	c.Conn.Close()
+	c.ExitBufChan <- true
+	close(c.ExitBufChan)
 }
