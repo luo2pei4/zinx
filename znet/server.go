@@ -10,47 +10,51 @@ import (
 )
 
 type Server struct {
-	Name  string
-	IPVer string
-	IP    string
-	Port  int
+	Name   string
+	IPVer  string
+	IP     string
+	Port   int
+	Router ziface.IRouter
 }
 
 type Connection struct {
-	Conn        *net.TCPConn    // 当前连接的socket tcp套接字
-	ConnID      uint32          // 当前连接的ID
-	isClosed    bool            // 当前连接关闭状态
-	handleAPI   ziface.HandFunc // 该连接的处理方法API
-	ExitBufChan chan bool       // 通知连接推出的chan
+	Conn     *net.TCPConn // 当前连接的socket tcp套接字
+	ConnID   uint32       // 当前连接的ID
+	isClosed bool         // 当前连接关闭状态
+	// handleAPI   ziface.HandFunc // 该连接的处理方法API
+	Router      ziface.IRouter // 通过路由接口处理连接请求
+	ExitBufChan chan bool      // 通知连接推出的chan
 }
 
 func NewServer(name string) ziface.IServer {
 	return &Server{
-		Name:  name,
-		IPVer: "tcp4",
-		IP:    "0.0.0.0",
-		Port:  6666,
+		Name:   name,
+		IPVer:  "tcp4",
+		IP:     "0.0.0.0",
+		Port:   6666,
+		Router: nil,
 	}
 }
 
-func NewConnection(conn *net.TCPConn, connID uint32, callback_api ziface.HandFunc) *Connection {
+func NewConnection(conn *net.TCPConn, connID uint32, router ziface.IRouter) *Connection {
 	return &Connection{
-		Conn:        conn,
-		ConnID:      connID,
-		isClosed:    false,
-		handleAPI:   callback_api,
+		Conn:     conn,
+		ConnID:   connID,
+		isClosed: false,
+		// handleAPI:   callback_api,
+		Router:      router,
 		ExitBufChan: make(chan bool, 1),
 	}
 }
 
-func CallBackToClient(conn *net.TCPConn, data []byte, cnt int) error {
-	fmt.Println("[Conn Handle] CallBackToClient...")
-	if _, err := conn.Write(data[:cnt]); err != nil {
-		fmt.Println("write back buf error,", err.Error())
-		return errors.New("CallBackToClient error")
-	}
-	return nil
-}
+// func CallBackToClient(conn *net.TCPConn, data []byte, cnt int) error {
+// 	fmt.Println("[Conn Handle] CallBackToClient...")
+// 	if _, err := conn.Write(data[:cnt]); err != nil {
+// 		fmt.Println("write back buf error,", err.Error())
+// 		return errors.New("CallBackToClient error")
+// 	}
+// 	return nil
+// }
 
 func (s *Server) Start() {
 	fmt.Printf("[START] server listenner at IP: %s, Port: %d, is starting\n", s.IP, s.Port)
@@ -81,7 +85,7 @@ func (s *Server) Start() {
 			}
 
 			// 用获取的连接新建一个用来处理链接数据的实例
-			dealConn := NewConnection(conn, cID, CallBackToClient)
+			dealConn := NewConnection(conn, cID, s.Router)
 			cID++
 
 			go dealConn.Start()
@@ -101,6 +105,11 @@ func (s *Server) Serve() {
 	}
 }
 
+func (s *Server) AddRouter(router ziface.IRouter) {
+	s.Router = router
+	fmt.Println("add router successed")
+}
+
 // 读取请求数据的方法，以goroutine形式运行
 func (c *Connection) StartReader() {
 	fmt.Println("Reader goroutine is running")
@@ -109,7 +118,7 @@ func (c *Connection) StartReader() {
 
 	for {
 		buf := make([]byte, 512)
-		n, err := c.Conn.Read(buf)
+		_, err := c.Conn.Read(buf)
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
 				fmt.Println("receive buf failed,", err.Error())
@@ -117,11 +126,20 @@ func (c *Connection) StartReader() {
 			c.ExitBufChan <- true
 			return
 		}
-		if err := c.handleAPI(c.Conn, buf, n); err != nil {
-			fmt.Println("connID", c.ConnID, "handle is error.", err.Error())
-			c.ExitBufChan <- true
-			return
+		// if err := c.handleAPI(c.Conn, buf, n); err != nil {
+		// 	fmt.Println("connID", c.ConnID, "handle is error.", err.Error())
+		// 	c.ExitBufChan <- true
+		// 	return
+		// }
+		req := Request{
+			conn: c,
+			data: buf,
 		}
+		go func(request ziface.IRequest) {
+			c.Router.PreHandle(request)
+			c.Router.Handle(request)
+			c.Router.PostHandle(request)
+		}(&req)
 	}
 }
 
@@ -138,4 +156,8 @@ func (c *Connection) Stop() {
 	c.Conn.Close()
 	c.ExitBufChan <- true
 	close(c.ExitBufChan)
+}
+
+func (c *Connection) GetTCPConnection() *net.TCPConn {
+	return c.Conn
 }
